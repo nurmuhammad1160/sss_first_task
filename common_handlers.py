@@ -1,4 +1,3 @@
-# common_handlers.py
 import json
 import pymongo
 from datetime import datetime
@@ -9,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 
-def load_sensor_codes(json_file_path):
+def load_sensor_codes(json_file_path): 
     sensor_codes = set() 
     try:
         with open(json_file_path, 'r', encoding='utf-8') as f:
@@ -26,7 +25,8 @@ def load_sensor_codes(json_file_path):
         return None
     return sensor_codes
 
-def get_mongo_collections(connection_string, db_name, hist_coll_name, last_coll_name):
+
+def get_mongo_collections(connection_string, db_name, hist_coll_name, last_coll_name): 
     try:
         mongo_client = pymongo.MongoClient(connection_string)
         mongo_client.admin.command('ping') 
@@ -42,38 +42,51 @@ def get_mongo_collections(connection_string, db_name, hist_coll_name, last_coll_
         logger.error(f"MongoDB ni sozlashda boshqa xatolik: {e_mongo}")
     return None, None, None
 
+
+
 def save_to_mongodb_logic(topic, sensor_code, payload_json, historical_collection, last_data_collection):
-    if not historical_collection or not last_data_collection:
-        logger.warning("MongoDB kolleksiyalari mavjud emas, ma'lumot saqlanmadi.")
+    logger.info(f"@@@ save_to_mongodb_logic FUNKSIYASI CHAQRILDI: Sensor {sensor_code}, Mavzu: {topic} @@@") 
+    
+    if historical_collection is None or last_data_collection is None:
+        logger.warning(f"MongoDB WRITE SKIPPED (kolleksiyalar None yoki topilmadi): Sensor {sensor_code}, Mavzu: {topic}")
         return
 
     try:
         message_type = topic.split('/')[-1]
+        current_time = datetime.now() 
 
         historical_doc = {
             "sensor_code": sensor_code,
             "topic": topic,
             "message_type": message_type,
             "payload": payload_json,
-            "received_at": datetime.now()
+            "received_at": current_time
         }
-        historical_collection.insert_one(historical_doc)
+        insert_result = historical_collection.insert_one(historical_doc)
+        logger.info(f"MongoDB'ga MUVAFFAQIYATLI YOZILDI (historical): Sensor {sensor_code}, MongoDocID: {insert_result.inserted_id}, Mavzu: {topic}")
 
         last_data_filter = {"sensor_code": sensor_code}
         update_fields = {
             f"last_{message_type}_payload": payload_json,
             f"last_{message_type}_topic": topic,
-            f"last_{message_type}_received_at": datetime.now()
+            f"last_{message_type}_received_at": current_time
         }
         last_data_collection.update_one(
             last_data_filter,
-            {"$set": update_fields, "$setOnInsert": {"sensor_code": sensor_code, "first_seen_at": datetime.now()}},
+            {"$set": update_fields, "$setOnInsert": {"sensor_code": sensor_code, "first_seen_at": current_time}},
             upsert=True
         )
-    except Exception as e:
-        logger.error(f"MongoDB ga yozishda xatolik ({sensor_code}): {e}", exc_info=False) # exc_info=True ko'proq ma'lumot beradi
 
-def on_connect_factory(broker_host, topic_to_subscribe):
+    except Exception as e:
+        logger.error(f"MongoDB'ga YOZISHDA XATOLIK (save_to_mongodb_logic ichida): Sensor {sensor_code}, Mavzu: {topic}, Xato: {e}", exc_info=True)
+
+
+
+
+
+
+        
+def on_connect_factory(broker_host, topic_to_subscribe): # O'zgarishsiz
     def on_connect(client, userdata, flags, rc, properties=None):
         if rc == 0:
             logger.info(f"Brokerga muvaffaqiyatli ulanildi: {broker_host}")
@@ -82,6 +95,25 @@ def on_connect_factory(broker_host, topic_to_subscribe):
         else:
             logger.error(f"Brokerga ({broker_host}) ulanishda xatolik, kod: {rc}")
     return on_connect
+
+
+
+
+def _task_done_callback(future):
+    """ThreadPoolExecutor da bajarilgan vazifa tugagach chaqiriladi."""
+    try:
+        result = future.result()  # Agar vazifa xatolik bilan tugagan bo'lsa, .result() o'sha xatolikni qayta ko'taradi
+        # Agar save_to_mongodb_logic muvaffaqiyatli tugasa, u None qaytaradi (ya'ni result=None)
+        # Agar xohlasangiz, muvaffaqiyatli tugaganini log qilishingiz mumkin:
+        # if result is None: # Yoki boshqa biror tekshiruv
+        #     logger.debug("Potokdagi MongoDB yozish vazifasi muvaffaqiyatli yakunlandi.")
+    except Exception as e:
+        # Agar potokdagi vazifa (save_to_mongodb_logic) ichida try-except ushlay olmagan xatolik bo'lsa,
+        # yoki save_to_mongodb_logic ning o'zida umuman try-except bo'lmasa, bu yerda ushlanadi.
+        logger.error(f"POTOKDAGI VAZIFADA XATOLIK YUZ BERDI (ehtimol save_to_mongodb_logic da): {type(e).__name__} - {e}", exc_info=True)
+
+
+
 
 def on_message_factory(target_sensor_codes_set, historical_collection, last_data_collection, executor):
     def on_message(client, userdata, msg):
@@ -94,7 +126,10 @@ def on_message_factory(target_sensor_codes_set, historical_collection, last_data
 
                 if sensor_code_from_payload in target_sensor_codes_set:
                     logger.info(f"MAQSADLI SENSOR XABARI! Sensor: {sensor_code_from_payload}, Mavzu: {msg.topic}")
-                    executor.submit(save_to_mongodb_logic, msg.topic, sensor_code_from_payload, payload_json, historical_collection, last_data_collection)
+                    # Vazifani executor ga yuborish va future obyektini olish
+                    future = executor.submit(save_to_mongodb_logic, msg.topic, sensor_code_from_payload, payload_json, historical_collection, last_data_collection)
+                    # Vazifa tugagach chaqiriladigan callback ni qo'shish
+                    future.add_done_callback(_task_done_callback) # <<<=== YANGI QATOR ===>>>
         except json.JSONDecodeError:
             logger.warning(f"JSON o'qish xatosi: {msg.payload.decode('utf-8', errors='ignore')[:100]} mavzuda: {msg.topic}")
         except UnicodeDecodeError:

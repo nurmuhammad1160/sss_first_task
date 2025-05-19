@@ -1,4 +1,3 @@
-# broker2_app.py
 import settings 
 import logging
 from common_handlers import load_sensor_codes, get_mongo_collections
